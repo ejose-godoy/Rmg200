@@ -67,3 +67,13 @@ O workflow executa ao receber o primeiro commit que publica o arquivo
 .github/workflows/arm64-kasan-lab.yml na branch main.
 Tambem pode ser acionado manualmente pela aba Actions.
 Nunca enviar boot_a.img. O processamento ARM64+QEMU ocorre apenas na nuvem.
+
+## Etapa seguinte: autoverificacao oficial KASAN em QEMU
+O Linux Android 5.4.147 usa CONFIG_TEST_KASAN=m: compila-se
+lib/test_kasan.ko, que e carregado pelo PID 1 apenas na VM efemera.
+O teste oficial cria acessos de memoria invalidos **intencionais dentro
+da VM** para comprovar que KASAN os registra. E esperado que
+init_module retorne EAGAIN ao final dessa suite. A verificacao exige
+KASAN_SELFTEST_DONE, retorno esperado e ao menos dois alertas
+"BUG: KASAN:". Os logs sao preservados no artefato do GitHub.
+Nunca executar esse modulo no Moto G200.
