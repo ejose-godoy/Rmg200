@@ -45,6 +45,9 @@ class LabStaticGuards(unittest.TestCase):
         self.assertIn("-e KASAN_OUTLINE", txt)
         self.assertIn("KASAN_LAB_INIT_OK", txt)
         self.assertIn("GHOSTLOCK_TRIGGER=NOT_PERFORMED", txt)
+        self.assertIn("CONFIG_TEST_KASAN=m", txt)
+        self.assertIn("lib/test_kasan.ko", txt)
+        self.assertIn("KASAN_SELFTEST_DONE", txt)
 
 
 if __name__ == "__main__":
