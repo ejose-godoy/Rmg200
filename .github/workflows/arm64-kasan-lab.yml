@@ -1,0 +1,53 @@
+name: Moto G200 - KASAN ARM64 (laboratorio isolado)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/arm64-kasan-lab.yml
+      - scripts/**
+      - initramfs/**
+      - tests/**
+
+# Minimo privilegio; o pipeline nao recebe credenciais privadas.
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-kasan-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  arm64-kasan:
+    name: Linux 5.4 ARM64 KASAN no QEMU
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Obter somente os arquivos publicos do laboratorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Proibir arquivos privados / imagem Motorola
+        run: bash scripts/preflight.sh
+      - name: Instalar ferramentas no runner descartavel
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison flex build-essential gcc-12 libelf-dev libssl-dev \
+            cpio gzip xz-utils git make qemu-system-arm python3
+      - name: Validar scripts, protecoes e codigo de inicializacao
+        run: bash scripts/verify-local.sh
+      - name: Compilar e iniciar kernel publico com KASAN no QEMU
+        run: bash scripts/run-lab.sh
+      - name: Publicar logs tecnicos (sem imagem de boot ou kernel privado)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kasan-arm64-lab-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
