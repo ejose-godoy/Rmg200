@@ -1,0 +1,18 @@
+# Nunca enviar a imagem do firmware ou outros dados do dispositivo.
+*.img
+*.bin
+*.dtb
+*.elf
+*.cpio
+*.cpio.gz
+*.key
+*.pem
+*magisk*
+*boot_a*
+*userdata*
+*sepolicy*
+work/
+reports/
+*.o
+*.ko
+vmlinux
