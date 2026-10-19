@@ -95,7 +95,8 @@ STATE="iniciar QEMU e coletar log"
 set +e
 timeout -k 5s 240s qemu-system-aarch64 \
   -M virt -cpu cortex-a57 -accel tcg -smp 2 -m 2048 \
-  -nographic -no-reboot -monitor none \
+  -nodefaults -display none -serial stdio -nic none \
+  -no-reboot -monitor none \
   -kernel "$KERNEL" -initrd "$INITRD" \
   -append 'console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init loglevel=7 panic=-1' \
   > reports/qemu-serial.log 2>&1
@@ -105,6 +106,11 @@ printf 'qemu_exit_status=%s\n' "$qemu_status" > reports/qemu-result.txt
 if [[ "$qemu_status" -eq 124 || "$qemu_status" -eq 137 ]]; then
   echo 'FALHA: QEMU excedeu limite de tempo' >&2
   exit 41
+fi
+if [[ "$qemu_status" -ne 0 ]]; then
+  printf 'FALHA: QEMU encerrou com codigo %s\n' "$qemu_status" >&2
+  sed -n '1,50p' reports/qemu-serial.log >&2
+  exit 44
 fi
 if ! grep -q 'KASAN_LAB_INIT_OK' reports/qemu-serial.log; then
   echo 'FALHA: nao apareceu marcador de inicializacao no console serial' >&2
