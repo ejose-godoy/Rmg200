@@ -30,6 +30,7 @@ nm "$out/vmlinux" | grep ' __asan_load' > /dev/null || { echo KASAN_RUNTIME_MISS
 sha256sum "$out/arch/arm64/boot/Image" "$out/vmlinux" > reports/kernel-sha256.txt
 state=guest
 mkdir -p "$rootfs/dev" "$rootfs/proc"
+chmod 0755 "$rootfs" "$rootfs/dev" "$rootfs/proc"
 gcc-12 -O2 -static -Wall -Wextra -Werror -o "$rootfs/init" initramfs/reach14_init.c
 ( cd "$rootfs"; find . -print0 | cpio --null -o -H newc --quiet | gzip -9 ) > work/reach14-initramfs.cpio.gz
 state=qemu
