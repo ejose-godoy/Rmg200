@@ -1,0 +1,53 @@
+name: Moto G200 REACH-15 AOSP QEMU ARM64 Binder KASAN normal reference lifecycle
+on:
+  workflow_dispatch:
+  push:
+    branches: [reach15-20261021]
+    paths:
+      - .github/workflows/arm64-reach15.yml
+      - scripts/run-reach15.sh
+      - scripts/reach15_binder_instrument.py
+      - initramfs/reach15_init.c
+      - tests/test_reach15.py
+permissions:
+  contents: read
+concurrency:
+  group: reach15-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  qemu-binder:
+    name: Binder KASAN - ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [unpatched, corrected]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    env:
+      REACH15_VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Checkout only public files
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Public-only preflight
+        run: bash scripts/preflight.sh
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bc bison flex build-essential gcc-12 libelf-dev libssl-dev cpio gzip git make qemu-system-arm python3
+      - name: Run local tests
+        run: bash scripts/verify-local.sh
+      - name: Run normal Binder reference lifecycle on virtual ARM64
+        run: bash scripts/run-reach15.sh
+      - name: Upload textual evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach15-${{ matrix.variant }}-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
