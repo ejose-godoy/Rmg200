@@ -1,0 +1,291 @@
+name: REACH-18 AOSP original Binder normal-ref vs invalid-handle comparison
+on:
+  push:
+    branches: [reach15-20261021]
+    paths:
+      - .github/workflows/arm64-reach18.yml
+permissions:
+  contents: read
+concurrency:
+  group: reach18-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  original-only:
+    name: AOSP 5.4.147 unpatched - UID10000 two-path Binder
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout authorized public repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check public-only inputs
+        run: bash scripts/preflight.sh
+      - name: Install ARM64 kernel build and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bc bison flex build-essential gcc-12 libelf-dev libssl-dev cpio gzip git make qemu-system-arm python3
+      - name: Build pinned unpatched AOSP ARM64 5.4.147 with KASAN
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p work reports
+          src="$PWD/work/linux-public"
+          out="$PWD/work/kernel-out"
+          rootfs="$PWD/work/rootfs"
+          git clone --depth 1 --single-branch --branch android12-5.4.147_r00 https://android.googlesource.com/kernel/common "$src"
+          test "$(git -C "$src" rev-parse HEAD)" = 34b5f809f17e66d5011086a3d90802989e667f75
+          test "$(git -C "$src" hash-object drivers/android/binder.c)" = 24055ff221e7ccd5be536ac7a82998a5aa1f154f
+          printf 'REACH18_VARIANT=unpatched\nREACH18_PUBLIC_AOSP_PINNED=PASS\nREACH18_BADSPIN_PATCH=ABSENT\n' > reports/original-kernel-provenance.txt
+          # Passive logging only; keep AOSP BadSpin bugfix ABSENT.
+          python3 - "$src/drivers/android/binder.c" <<'REACH18_OBSERVER'
+          from pathlib import Path
+          import sys, subprocess, hashlib
+          p=Path(sys.argv[1])
+          blob=subprocess.check_output(["git","hash-object",str(p)],text=True).strip()
+          assert blob=="24055ff221e7ccd5be536ac7a82998a5aa1f154f",blob
+          s=p.read_text()
+          old="\tret = binder_inc_ref_olocked(ref, strong, target_list);\n\t*rdata = ref->data;\n"
+          extra="\tif (new_ref && ref == new_ref) {\n" \
+                "\t\tif (ret)\n" \
+                "\t\t\tpr_info(\"REACH18_NEW_REF_INCREMENT_FAILED=1\\n\");\n" \
+                "\t\telse\n" \
+                "\t\t\tpr_info(\"REACH18_NEW_REF_INCREMENT_OK=1\\n\");\n" \
+                "\t}\n"
+          assert s.count(old)==1
+          s=s.replace(old,old+extra,1)
+          cleanup="static void binder_cleanup_ref_olocked(struct binder_ref *ref)\n{\n\tbool delete_node = false;\n"
+          assert s.count(cleanup)==1
+          s=s.replace(cleanup,cleanup+"\tpr_info(\"REACH18_REF_CLEANUP_CALLED=1\\n\");\n",1)
+          ref=s.split("static int binder_inc_ref_for_node(",1)[1].split("static void binder_pop_transaction_ilocked",1)[0]
+          assert "binder_cleanup_ref_olocked(new_ref)" not in ref
+          assert "if (new_ref && ref != new_ref)" in ref
+          assert "REACH18_NEW_REF_INCREMENT_FAILED=1" in ref
+          assert "REACH18_NEW_REF_INCREMENT_OK=1" in ref
+          p.write_text(s)
+          print("REACH18_SOURCE_OBSERVER_ONLY=PASS")
+          print("REACH18_PATCH_BADSPIN=ABSENT")
+          print("REACH18_OBSERVED_BINDER_SHA256="+hashlib.sha256(p.read_bytes()).hexdigest())
+          REACH18_OBSERVER
+          export ARCH=arm64
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 defconfig
+          cfg="$out/.config"
+          "$src/scripts/config" --file "$cfg" -e ANDROID -e ANDROID_BINDER_IPC --set-str ANDROID_BINDER_DEVICES binder -d ANDROID_BINDERFS -e KASAN -e KASAN_GENERIC -e KASAN_OUTLINE -d KASAN_SW_TAGS -d KASAN_INLINE -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL -e DEVTMPFS -e DEVTMPFS_MOUNT -e BLK_DEV_INITRD -e RD_GZIP -e SERIAL_AMBA_PL011 -e SERIAL_AMBA_PL011_CONSOLE -d RANDOMIZE_BASE -d CFI_CLANG -d LTO_CLANG -d LTO_CLANG_THIN -d DEBUG_INFO
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 olddefconfig
+          for opt in 'CONFIG_ANDROID_BINDER_IPC=y' 'CONFIG_ANDROID_BINDER_DEVICES="binder"' 'CONFIG_DEVTMPFS=y' 'CONFIG_KASAN=y' 'CONFIG_KASAN_GENERIC=y'; do
+            grep -Fxq "$opt" "$cfg" || { echo "REACH18_MISSING_CONFIG=$opt";exit 62;}
+          done
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 -j2 Image > reports/kernel-build.log 2>&1 || { tail -70 reports/kernel-build.log;exit 63;}
+          test -s "$out/arch/arm64/boot/Image"
+          nm "$out/vmlinux" | grep ' binder_inc_ref_for_node' > /dev/null || exit 64
+          nm "$out/vmlinux" | grep ' __asan_load' > /dev/null || exit 65
+          sha256sum "$out/arch/arm64/boot/Image" "$out/vmlinux" > reports/kernel-sha256.txt
+          printf 'REACH18_BUILD=PASS\n' > reports/build-status.txt
+      - name: Run unpatched Binder normal reference and negative control
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          rootfs="$PWD/work/rootfs"
+          out="$PWD/work/kernel-out"
+          mkdir -p "$rootfs/dev" "$rootfs/proc"
+          cat > "$rootfs/reach18_init.c" <<'REACH18_C_SOURCE'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <grp.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <sys/mount.h>
+          #include <sys/reboot.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          
+          struct binder_write_read {
+           uint64_t write_size, write_consumed, write_buffer;
+           uint64_t read_size, read_consumed, read_buffer;
+          };
+          #define BINDER_VERSION _IOWR('b', 9, int)
+          #define BINDER_SET_CONTEXT_MGR _IOW('b', 7, int)
+          #define BINDER_WRITE_READ _IOWR('b', 1, struct binder_write_read)
+          #define BC_INCREFS _IOW('c', 4, uint32_t)
+          #define BC_ACQUIRE _IOW('c', 5, uint32_t)
+          #define BC_RELEASE _IOW('c', 6, uint32_t)
+          #define BC_DECREFS _IOW('c', 7, uint32_t)
+          
+          static int drop_uid(void) {
+           if(setgroups(0,NULL))return 1;
+           if(setresgid(10000,10000,10000))return 2;
+           if(setresuid(10000,10000,10000))return 3;
+           return getuid()==10000 && geteuid()==10000 ? 0 : 4;
+          }
+          static int basic_open(void) {
+           int fd=open("/dev/binder",O_RDWR|O_CLOEXEC);
+           if(fd<0){printf("REACH18_OPEN_ERRNO=%d\n",errno);return -1;}
+           int version=-1;
+           if(ioctl(fd,BINDER_VERSION,&version)!=0||version!=8){close(fd);return -1;}
+           return fd;
+          }
+          static int manager(int ready_fd,int quit_fd) {
+           int err=drop_uid();
+           if(err)return 20+err;
+           int fd=basic_open();
+           if(fd<0)return 25;
+           errno=0;
+           int rc=ioctl(fd,BINDER_SET_CONTEXT_MGR,0);
+           printf("REACH18_CONTEXT_MANAGER_RET=%d ERRNO=%d\n",rc,errno);
+           if(rc){close(fd);return 26;}
+           puts("REACH18_CONTEXT_MANAGER_UID=10000");
+           if(write(ready_fd,"R",1)!=1){close(fd);return 27;}
+           close(ready_fd);
+           char done=0;
+           if(read(quit_fd,&done,1)!=1 || done!='Q'){close(fd);return 28;}
+           close(quit_fd);
+           close(fd);
+           puts("REACH18_MANAGER_CLOSED_NORMALLY=1");
+           return 0;
+          }
+          static int send_command(int fd, uint32_t cmd,const char *name) {
+           struct {uint32_t command;uint32_t handle;} msg={cmd,0};
+           struct binder_write_read bwr={0};
+           bwr.write_size=sizeof(msg);
+           bwr.write_buffer=(uintptr_t)&msg;
+           errno=0;
+           int rc=ioctl(fd,BINDER_WRITE_READ,&bwr);
+           printf("REACH18_%s_RET=%d ERRNO=%d CONSUMED=%llu\n",name,rc,errno,
+                  (unsigned long long)bwr.write_consumed);
+           return rc==0 && bwr.write_consumed==sizeof(msg)?0:-1;
+          }
+          
+          static int invalid_ref(int fd, uint32_t cmd, const char *label) {
+           struct { uint32_t cmd, handle; } msg = { cmd, 31337U };
+           struct binder_write_read bwr = {0};
+           bwr.write_size = sizeof(msg);
+           bwr.write_buffer = (uintptr_t)&msg;
+           errno=0;
+           int rc=ioctl(fd,BINDER_WRITE_READ,&bwr);
+           int e=errno;
+           printf("REACH18_INVALID_%s_IOCTL=%d ERRNO=%d CONSUMED=%llu\n",
+                  label,rc,e,(unsigned long long)bwr.write_consumed);
+           return rc==0 && bwr.write_consumed==sizeof(msg)?0:-1;
+          }
+          
+          static int client(void) {
+           int e=drop_uid();
+           if(e)return 30+e;
+           int fd=basic_open();
+           if(fd<0)return 35;
+           puts("REACH18_CLIENT_UID=10000");
+           /* Serialized legal reference increments and decrements. Manager remains
+            * alive until every command and descriptor close has finished. No races,
+            * forced errors, malformed offsets, Binder objects, or kernel exploit. */
+           if(send_command(fd,BC_INCREFS,"INCREFS")){close(fd);return 36;}
+           if(send_command(fd,BC_ACQUIRE,"ACQUIRE")){close(fd);return 37;}
+           if(send_command(fd,BC_RELEASE,"RELEASE")){close(fd);return 38;}
+           if(send_command(fd,BC_DECREFS,"DECREFS")){close(fd);return 39;}
+          
+           /* Separate negative control, after the normal reference is released. */
+           if(invalid_ref(fd,BC_INCREFS,"INCREFS")){close(fd);return 61;}
+           if(invalid_ref(fd,BC_ACQUIRE,"ACQUIRE")){close(fd);return 62;}
+           if(invalid_ref(fd,BC_RELEASE,"RELEASE")){close(fd);return 63;}
+           if(invalid_ref(fd,BC_DECREFS,"DECREFS")){close(fd);return 64;}
+           puts("REACH18_TWO_DISTINCT_PATHS_OBSERVED=1");
+           close(fd);
+           puts("REACH18_CLIENT_COMPLETED_NORMAL_REF_CYCLE=1");
+           puts("REACH18_NO_RACE=1");
+           puts("REACH18_NO_EXPLOIT=1");
+           puts("REACH18_NO_PRIVILEGE_CHANGE=1");
+           return 0;
+          }
+          int main(void) {
+           setvbuf(stdout,NULL,_IONBF,0);
+           puts("REACH18_QEMU_ONLY=1");
+           if(mount("devtmpfs","/dev","devtmpfs",0,NULL)){perror("mount");return 41;}
+           struct stat st;
+           if(stat("/",&st)||((st.st_mode&0005)!=0005))return 42;
+           if(stat("/dev",&st)||((st.st_mode&0005)!=0005))return 43;
+           if(stat("/dev/binder",&st)||!S_ISCHR(st.st_mode))return 44;
+           if(chmod("/dev/binder",0666))return 45;
+           puts("REACH18_VM_LOCAL_DAC_NOT_ANDROID_SELINUX=1");
+           int ready[2],quit[2];
+           if(pipe(ready)||pipe(quit))return 46;
+           pid_t mgr=fork();
+           if(mgr<0)return 47;
+           if(mgr==0){
+            close(ready[0]);close(quit[1]);
+            _exit(manager(ready[1],quit[0]));
+           }
+           close(ready[1]);close(quit[0]);
+           char r=0;
+           if(read(ready[0],&r,1)!=1||r!='R')return 48;
+           close(ready[0]);
+           pid_t ch=fork();
+           if(ch<0)return 49;
+           if(ch==0){close(quit[1]);_exit(client());}
+           int cs=-1;
+           if(waitpid(ch,&cs,0)<0)return 50;
+           int client_ok=WIFEXITED(cs)&&WEXITSTATUS(cs)==0;
+           printf("REACH18_CLIENT_EXIT=%d\n",WIFEXITED(cs)?WEXITSTATUS(cs):255);
+           if(write(quit[1],"Q",1)!=1)return 51;
+           close(quit[1]);
+           int ms=-1;
+           if(waitpid(mgr,&ms,0)<0)return 52;
+           int mgr_ok=WIFEXITED(ms)&&WEXITSTATUS(ms)==0;
+           printf("REACH18_MANAGER_EXIT=%d\n",WIFEXITED(ms)?WEXITSTATUS(ms):255);
+           puts(client_ok && mgr_ok?"REACH18_RESULT=PASS":"REACH18_RESULT=FAIL");
+           sync();
+           (void)reboot(RB_POWER_OFF);
+           return client_ok&&mgr_ok?0:53;
+          }
+          REACH18_C_SOURCE
+          gcc-12 -O2 -static -Wall -Wextra -Werror -o "$rootfs/init" "$rootfs/reach18_init.c"
+          rm "$rootfs/reach18_init.c"
+          chmod 0755 "$rootfs" "$rootfs/dev" "$rootfs/proc"
+          for dir in "$rootfs" "$rootfs/dev" "$rootfs/proc";do
+            test "$(stat -c %a "$dir")" = 755 || exit 69
+          done
+          (cd "$rootfs";find . -print0 | cpio --null -o -H newc --quiet | gzip -9) > work/reach18-initramfs.cpio.gz
+          set +e
+          timeout -k 5s 180s qemu-system-aarch64 -M virt -cpu cortex-a57 -accel tcg -smp 2 -m 2048 -nodefaults -display none -serial stdio -nic none -no-reboot -monitor none -kernel "$out/arch/arm64/boot/Image" -initrd work/reach18-initramfs.cpio.gz -append 'console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init loglevel=7 panic=-1 panic_on_warn=0 kasan_multi_shot' > reports/qemu-serial.log 2>&1
+          rc=$?
+          set -e
+          echo "REACH18_QEMU_EXIT=$rc" > reports/qemu-result.txt
+          if ((rc!=0));then tail -85 reports/qemu-serial.log;exit 66;fi
+          for marker in 'REACH18_PUBLIC_AOSP_ORIGINAL_ONLY=1' 'REACH18_VM_CHMOD_NOT_MOTOROLA_SELINUX=1' 'REACH18_CONTEXT_MANAGER_UID=10000' 'REACH18_CLIENT_UID=10000' 'REACH18_INCREFS_RET=0 ERRNO=0 CONSUMED=8' 'REACH18_ACQUIRE_RET=0 ERRNO=0 CONSUMED=8' 'REACH18_RELEASE_RET=0 ERRNO=0 CONSUMED=8' 'REACH18_DECREFS_RET=0 ERRNO=0 CONSUMED=8' 'REACH18_NEW_REF_INCREMENT_OK=1' 'REACH18_REF_CLEANUP_CALLED=1' 'REACH18_INVALID_INCREFS_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH18_INVALID_ACQUIRE_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH18_INVALID_RELEASE_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH18_INVALID_DECREFS_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH18_TWO_DISTINCT_PATHS_OBSERVED=1' 'REACH18_CLIENT_COMPLETED_NORMAL_REF_CYCLE=1' 'REACH18_NO_RACE=1' 'REACH18_NO_EXPLOIT=1' 'REACH18_CLIENT_EXIT=0' 'REACH18_MANAGER_EXIT=0' 'REACH18_RESULT=PASS';do
+            grep -Fq "$marker" reports/qemu-serial.log || { echo "REACH18_MISSING_MARKER=$marker";exit 67;}
+          done
+          if grep -Fq 'REACH18_NEW_REF_INCREMENT_FAILED=1' reports/qemu-serial.log;then
+            echo 'REACH18_UNEXPECTED_NEW_REF_INCREMENT_FAILURE';exit 71
+          fi
+          # Driver must reject the invalid reference; BINDER_WRITE_READ itself can return 0.
+          grep -F 'refcount change on invalid ref 31337 ret -22' reports/qemu-serial.log > reports/invalid-handle-kernel-logs.txt || { echo REACH18_REJECTION_LOG_MISSING;exit 68;}
+          test "$(wc -l < reports/invalid-handle-kernel-logs.txt)" -eq 4 || { echo REACH18_EXPECTED_FOUR_REJECTIONS;exit 72;}
+          if grep -Eq 'BUG: KASAN:|Kernel panic|Unable to handle kernel paging request|Oops:' reports/qemu-serial.log;then
+            echo REACH18_KERNEL_SAFETY_FAIL;exit 70
+          fi
+          {
+            echo 'REACH18_STATUS=PASS'
+            echo 'REACH18_VARIANT=unpatched'
+            echo 'REACH18_UID10000_TWO_PATHS=PASS'
+            echo 'REACH18_KASAN_ALERTS=0'
+            echo 'REACH18_BADSPIN_RACE=NOT_EXECUTED'
+            echo 'REACH18_NEW_REF_FAILURE=NOT_TRIGGERED'
+            echo 'REACH18_UAF=NOT_DEMONSTRATED'
+            echo 'REACH18_ROOT=NOT_OBTAINED'
+            echo 'REACH18_MOTOROLA=NOT_TOUCHED'
+          } >> reports/qemu-result.txt
+      - name: Upload REACH-18 textual evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach18-original-unpatched-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
