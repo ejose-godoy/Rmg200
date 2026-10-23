@@ -1,0 +1,204 @@
+name: REACH-17 AOSP original Binder invalid-handle KASAN control
+on:
+  push:
+    branches: [reach15-20261021]
+    paths:
+      - .github/workflows/arm64-reach17.yml
+permissions:
+  contents: read
+concurrency:
+  group: reach17-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  original-only:
+    name: AOSP 5.4.147 unpatched - UID10000 invalid Binder handle
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout authorized public repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check public-only inputs
+        run: bash scripts/preflight.sh
+      - name: Install ARM64 kernel build and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bc bison flex build-essential gcc-12 libelf-dev libssl-dev cpio gzip git make qemu-system-arm python3
+      - name: Build pinned unpatched AOSP ARM64 5.4.147 with KASAN
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p work reports
+          src="$PWD/work/linux-public"
+          out="$PWD/work/kernel-out"
+          rootfs="$PWD/work/rootfs"
+          git clone --depth 1 --single-branch --branch android12-5.4.147_r00 https://android.googlesource.com/kernel/common "$src"
+          test "$(git -C "$src" rev-parse HEAD)" = 34b5f809f17e66d5011086a3d90802989e667f75
+          test "$(git -C "$src" hash-object drivers/android/binder.c)" = 24055ff221e7ccd5be536ac7a82998a5aa1f154f
+          printf 'REACH17_VARIANT=unpatched\nREACH17_PUBLIC_AOSP_PINNED=PASS\nREACH17_BADSPIN_PATCH=ABSENT\n' > reports/original-kernel-provenance.txt
+          export ARCH=arm64
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 defconfig
+          cfg="$out/.config"
+          "$src/scripts/config" --file "$cfg" -e ANDROID -e ANDROID_BINDER_IPC --set-str ANDROID_BINDER_DEVICES binder -d ANDROID_BINDERFS -e KASAN -e KASAN_GENERIC -e KASAN_OUTLINE -d KASAN_SW_TAGS -d KASAN_INLINE -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL -e DEVTMPFS -e DEVTMPFS_MOUNT -e BLK_DEV_INITRD -e RD_GZIP -e SERIAL_AMBA_PL011 -e SERIAL_AMBA_PL011_CONSOLE -d RANDOMIZE_BASE -d CFI_CLANG -d LTO_CLANG -d LTO_CLANG_THIN -d DEBUG_INFO
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 olddefconfig
+          for opt in 'CONFIG_ANDROID_BINDER_IPC=y' 'CONFIG_ANDROID_BINDER_DEVICES="binder"' 'CONFIG_DEVTMPFS=y' 'CONFIG_KASAN=y' 'CONFIG_KASAN_GENERIC=y'; do
+            grep -Fxq "$opt" "$cfg" || { echo "REACH17_MISSING_CONFIG=$opt";exit 62;}
+          done
+          make -C "$src" O="$out" ARCH=arm64 CC=gcc-12 -j2 Image > reports/kernel-build.log 2>&1 || { tail -70 reports/kernel-build.log;exit 63;}
+          test -s "$out/arch/arm64/boot/Image"
+          nm "$out/vmlinux" | grep ' binder_inc_ref_for_node' > /dev/null || exit 64
+          nm "$out/vmlinux" | grep ' __asan_load' > /dev/null || exit 65
+          sha256sum "$out/arch/arm64/boot/Image" "$out/vmlinux" > reports/kernel-sha256.txt
+          printf 'REACH17_BUILD=PASS\n' > reports/build-status.txt
+      - name: Run guest UID 10000 Binder negative-control smoke test
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          rootfs="$PWD/work/rootfs"
+          out="$PWD/work/kernel-out"
+          mkdir -p "$rootfs/dev" "$rootfs/proc"
+          cat > "$rootfs/reach17_init.c" <<'REACH17_C_SOURCE'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <grp.h>
+          #include <linux/ioctl.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <sys/mount.h>
+          #include <sys/reboot.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          struct binder_write_read {
+              uint64_t write_size, write_consumed, write_buffer;
+              uint64_t read_size, read_consumed, read_buffer;
+          };
+          struct binder_node_debug_info {
+              uint64_t ptr, cookie;
+              uint32_t has_strong_ref, has_weak_ref;
+          };
+          #define BINDER_VERSION _IOWR('b', 9, int)
+          #define BINDER_WRITE_READ _IOWR('b', 1, struct binder_write_read)
+          #define BINDER_GET_NODE_DEBUG_INFO _IOWR('b', 11, struct binder_node_debug_info)
+          #define BC_INCREFS _IOW('c', 4, uint32_t)
+          #define BC_ACQUIRE _IOW('c', 5, uint32_t)
+          #define BC_RELEASE _IOW('c', 6, uint32_t)
+          #define BC_DECREFS _IOW('c', 7, uint32_t)
+          static int no_local_nodes(int fd, const char *when) {
+              struct binder_node_debug_info d = {0};
+              errno=0;
+              int rc=ioctl(fd,BINDER_GET_NODE_DEBUG_INFO,&d);
+              printf("REACH17_NODES_%s_RET=%d ERRNO=%d PTR=%llu\n",when,rc,errno,
+                     (unsigned long long)d.ptr);
+              return rc==0 && d.ptr==0 ? 0 : 1;
+          }
+          static int invalid_ref(int fd,uint32_t cmd,const char *label) {
+              struct {uint32_t cmd, handle;} msg={cmd,31337U};
+              struct binder_write_read bwr={0};
+              bwr.write_size=sizeof(msg);
+              bwr.write_buffer=(uintptr_t)&msg;
+              errno=0;
+              int rc=ioctl(fd,BINDER_WRITE_READ,&bwr);
+              int error=errno;
+              printf("REACH17_INVALID_%s_IOCTL=%d ERRNO=%d CONSUMED=%llu\n",
+                     label,rc,error,(unsigned long long)bwr.write_consumed);
+              /* Binder ioctl may succeed while its BC command is rejected.
+                 Kernel log is checked independently for the rejection message. */
+              return rc==0 && bwr.write_consumed==sizeof(msg) ? 0 : 1;
+          }
+          static int unprivileged_probe(void) {
+              if(setgroups(0,NULL)||setresgid(10000,10000,10000)||
+                 setresuid(10000,10000,10000))return 31;
+              if(getuid()!=10000||geteuid()!=10000)return 32;
+              puts("REACH17_GUEST_UID=10000");
+              int fd=open("/dev/binder",O_RDWR|O_CLOEXEC);
+              if(fd<0){perror("open binder");return 33;}
+              puts("REACH17_BINDER_OPEN=PASS");
+              int version=-1;
+              if(ioctl(fd,BINDER_VERSION,&version)||version!=8){close(fd);return 34;}
+              puts("REACH17_BINDER_VERSION=8");
+              if(no_local_nodes(fd,"BEFORE")){close(fd);return 35;}
+              if(invalid_ref(fd,BC_INCREFS,"INCREFS")){close(fd);return 36;}
+              if(invalid_ref(fd,BC_ACQUIRE,"ACQUIRE")){close(fd);return 37;}
+              if(invalid_ref(fd,BC_RELEASE,"RELEASE")){close(fd);return 38;}
+              if(invalid_ref(fd,BC_DECREFS,"DECREFS")){close(fd);return 39;}
+              if(no_local_nodes(fd,"AFTER")){close(fd);return 40;}
+              close(fd);
+              if(getuid()!=10000||geteuid()!=10000)return 41;
+              puts("REACH17_GUEST_UID_AFTER=10000");
+              puts("REACH17_NO_TRANSACTION=1");
+              puts("REACH17_NO_RACE=1");
+              puts("REACH17_NO_EXPLOIT=1");
+              puts("REACH17_NEGATIVE_CONTROL=PASS");
+              return 0;
+          }
+          int main(void) {
+              setvbuf(stdout,NULL,_IONBF,0);
+              puts("REACH17_PUBLIC_AOSP_ORIGINAL_ONLY=1");
+              if(mount("devtmpfs","/dev","devtmpfs",0,NULL)){perror("devtmpfs");return 51;}
+              struct stat st;
+              if(stat("/",&st)||((st.st_mode&0005)!=0005))return 52;
+              if(stat("/dev",&st)||((st.st_mode&0005)!=0005))return 53;
+              if(stat("/dev/binder",&st)||!S_ISCHR(st.st_mode))return 54;
+              if(chmod("/dev/binder",0666))return 55;
+              puts("REACH17_VM_CHMOD_NOT_MOTOROLA_SELINUX=1");
+              pid_t pid=fork();
+              if(pid<0)return 56;
+              if(pid==0)_exit(unprivileged_probe());
+              int status=0;
+              if(waitpid(pid,&status,0)<0)return 57;
+              int good=WIFEXITED(status)&&WEXITSTATUS(status)==0;
+              printf("REACH17_CHILD_EXIT=%d\n",WIFEXITED(status)?WEXITSTATUS(status):255);
+              puts(good?"REACH17_RESULT=PASS":"REACH17_RESULT=FAIL");
+              sync();
+              (void)reboot(RB_POWER_OFF);
+              return good?0:58;
+          }
+          REACH17_C_SOURCE
+          gcc-12 -O2 -static -Wall -Wextra -Werror -o "$rootfs/init" "$rootfs/reach17_init.c"
+          rm "$rootfs/reach17_init.c"
+          chmod 0755 "$rootfs" "$rootfs/dev" "$rootfs/proc"
+          for dir in "$rootfs" "$rootfs/dev" "$rootfs/proc";do
+            test "$(stat -c %a "$dir")" = 755 || exit 69
+          done
+          (cd "$rootfs";find . -print0 | cpio --null -o -H newc --quiet | gzip -9) > work/reach17-initramfs.cpio.gz
+          set +e
+          timeout -k 5s 180s qemu-system-aarch64 -M virt -cpu cortex-a57 -accel tcg -smp 2 -m 2048 -nodefaults -display none -serial stdio -nic none -no-reboot -monitor none -kernel "$out/arch/arm64/boot/Image" -initrd work/reach17-initramfs.cpio.gz -append 'console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init loglevel=7 panic=-1 panic_on_warn=0 kasan_multi_shot' > reports/qemu-serial.log 2>&1
+          rc=$?
+          set -e
+          echo "REACH17_QEMU_EXIT=$rc" > reports/qemu-result.txt
+          if ((rc!=0));then tail -85 reports/qemu-serial.log;exit 66;fi
+          for marker in 'REACH17_PUBLIC_AOSP_ORIGINAL_ONLY=1' 'REACH17_VM_CHMOD_NOT_MOTOROLA_SELINUX=1' 'REACH17_GUEST_UID=10000' 'REACH17_BINDER_OPEN=PASS' 'REACH17_BINDER_VERSION=8' 'REACH17_NODES_BEFORE_RET=0 ERRNO=0 PTR=0' 'REACH17_NODES_AFTER_RET=0 ERRNO=0 PTR=0' 'REACH17_INVALID_INCREFS_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH17_INVALID_ACQUIRE_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH17_INVALID_RELEASE_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH17_INVALID_DECREFS_IOCTL=0 ERRNO=0 CONSUMED=8' 'REACH17_GUEST_UID_AFTER=10000' 'REACH17_NO_TRANSACTION=1' 'REACH17_NO_RACE=1' 'REACH17_NO_EXPLOIT=1' 'REACH17_NEGATIVE_CONTROL=PASS' 'REACH17_CHILD_EXIT=0' 'REACH17_RESULT=PASS';do
+            grep -Fq "$marker" reports/qemu-serial.log || { echo "REACH17_MISSING_MARKER=$marker";exit 67;}
+          done
+          # Driver must reject the invalid reference; BINDER_WRITE_READ itself can return 0.
+          grep -F 'refcount change on invalid ref 31337 ret -22' reports/qemu-serial.log > reports/invalid-handle-kernel-logs.txt || { echo REACH17_REJECTION_LOG_MISSING;exit 68;}
+          if grep -Eq 'BUG: KASAN:|Kernel panic|Unable to handle kernel paging request|Oops:' reports/qemu-serial.log;then
+            echo REACH17_KERNEL_SAFETY_FAIL;exit 70
+          fi
+          {
+            echo 'REACH17_STATUS=PASS'
+            echo 'REACH17_VARIANT=unpatched'
+            echo 'REACH17_UID10000_INVALID_HANDLE_CONTROL=PASS'
+            echo 'REACH17_KASAN_ALERTS=0'
+            echo 'REACH17_BADSPIN_RACE=NOT_EXECUTED'
+            echo 'REACH17_UAF=NOT_DEMONSTRATED'
+            echo 'REACH17_ROOT=NOT_OBTAINED'
+            echo 'REACH17_MOTOROLA=NOT_TOUCHED'
+          } >> reports/qemu-result.txt
+      - name: Upload REACH-17 textual evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach17-original-unpatched-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7

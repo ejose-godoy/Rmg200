@@ -1,0 +1,60 @@
+name: Moto G200 - REACH-06 comparacao privilegios UID 10000 QEMU
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [reach06-20261020]
+    paths:
+      - .github/workflows/arm64-reach06.yml
+      - initramfs/reach06_init.c
+      - scripts/run-reach06.sh
+      - scripts/instrument-reach05.py
+      - tests/test_reach06.py
+
+# Apenas fonte publica, sem dados do smartphone ou credenciais.
+permissions:
+  contents: read
+
+concurrency:
+  group: reach06-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  reach06:
+    name: AOSP ARM64 5.4.147 - ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [unpatched, corrected]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      REACH06_VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Checkout somente codigo publico
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verificar privacidade e integridade
+        run: bash scripts/preflight.sh
+      - name: Instalar dependencias no runner efemero
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison flex build-essential gcc-12 libelf-dev libssl-dev \
+            cpio gzip xz-utils git make qemu-system-arm python3
+      - name: Validar scripts e testes sem tocar no celular
+        run: bash scripts/verify-local.sh
+      - name: Instrumentar e iniciar QEMU com usuario sem privilegios
+        run: bash scripts/run-reach06.sh
+      - name: Arquivar somente relatorios textuais
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach06-${{ matrix.variant }}-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
