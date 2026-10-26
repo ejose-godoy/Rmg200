@@ -1,0 +1,65 @@
+name: REACH-19G - auditoria estatica publica
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/reach19g-static.yml]
+permissions:
+  contents: read
+jobs:
+  source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Comparar fontes publicas sem executar exploit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports sources
+          python3 - <<'PY'
+          import urllib.request,hashlib,difflib,pathlib,re,json
+          root=pathlib.Path('sources'); report=pathlib.Path('reports')
+          urls={
+            'motorola_futex':'https://raw.githubusercontent.com/moto-common/android_kernel_motorola_msm-5.4/14/kernel/futex.c',
+            'motorola_rtmutex':'https://raw.githubusercontent.com/moto-common/android_kernel_motorola_msm-5.4/14/kernel/locking/rtmutex.c',
+            'aosp_futex':'https://android.googlesource.com/kernel/common/+/34b5f809f17e66d5011086a3d90802989e667f75/kernel/futex.c?format=TEXT',
+            'aosp_rtmutex':'https://android.googlesource.com/kernel/common/+/34b5f809f17e66d5011086a3d90802989e667f75/kernel/locking/rtmutex.c?format=TEXT',
+            'aquos_readme':'https://raw.githubusercontent.com/mouseos/aquos-r6-ghostlock/main/README.md',
+          }
+          import base64
+          results={}
+          for key,url in urls.items():
+            try:
+              req=urllib.request.Request(url,headers={'User-Agent':'REACH19G-public-source-audit'})
+              with urllib.request.urlopen(req,timeout=35) as resp: data=resp.read(2_000_000)
+              if 'googlesource' in url: data=base64.b64decode(data)
+              (root/(key+'.txt')).write_bytes(data)
+              results[key]={'status':'OK','bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'url':url}
+            except Exception as e: results[key]={'status':'UNAVAILABLE','error':str(e),'url':url}
+          for part in ('futex','rtmutex'):
+            a=root/('motorola_'+part+'.txt');b=root/('aosp_'+part+'.txt')
+            if a.exists() and b.exists():
+              x=a.read_text(errors='replace').splitlines();y=b.read_text(errors='replace').splitlines()
+              delta=list(difflib.unified_diff(y,x,fromfile='aosp/'+part,tofile='motorola/'+part,n=2))
+              (report/(part+'.diff')).write_text('\n'.join(delta[:6000])+'\n')
+              results[part+'_comparison']={'same_source':x==y,'diff_lines':len(delta),'truncated':len(delta)>6000}
+          results['motorola_binary_equivalence']='NOT_VERIFIED: Motorola device Image not uploaded'
+          results['ghostlock_vulnerability']='NOT_DETERMINED: source comparison alone is insufficient'
+          results['qemu_kasan']='NOT_EXECUTED_BY_THIS_WORKFLOW: separate arm64-kasan-lab.yml'
+          (report/'results.json').write_text(json.dumps(results,indent=2,ensure_ascii=False))
+          with (report/'summary.md').open('w') as f:
+            f.write('# REACH-19G - fontes publicas\n\n')
+            for key,val in results.items(): f.write(f'- **{key}**: {val}\n')
+            f.write('\nNenhum exploit, boot.img ou teste no dispositivo fisico foi executado.\n')
+          print((report/'summary.md').read_text()[:8000])
+          if not all(results.get(k,{}).get('status')=='OK' for k in ('motorola_futex','motorola_rtmutex','aosp_futex','aosp_rtmutex','aquos_readme')):
+            raise SystemExit('Fonte indisponivel: analise incompleta (FAIL)')
+          PY
+      - name: Publicar evidencias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach19g-static-evidence
+          path: reports/
+          retention-days: 7
+          if-no-files-found: warn
