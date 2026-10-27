@@ -1,6 +1,9 @@
 name: REACH-20A QEMU ARM64 KASAN baseline
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/reach20a-qemu-kasan.yml
 permissions:
   contents: read
 jobs:
@@ -11,11 +14,13 @@ jobs:
       - name: Install build and virtualization tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git make gcc bc bison flex libssl-dev libelf-dev libncurses-dev qemu-system-arm qemu-system-data busybox-static cpio gzip
+          sudo apt-get install -y --no-install-recommends git make gcc bc bison flex libssl-dev libelf-dev libncurses-dev qemu-system-arm qemu-system-data ipxe-qemu busybox-static cpio gzip
           uname -m
           test "$(uname -m)" = aarch64
           qemu-system-aarch64 --version
-          test -f /usr/share/qemu/efi-virtio.rom || { echo 'Missing efi-virtio.rom'; find /usr/share/qemu -maxdepth 2 -iname '*virtio*.rom'; exit 1; }
+          dpkg-query -W qemu-system-arm qemu-system-data ipxe-qemu
+          test -s /usr/lib/ipxe/qemu/efi-virtio.rom
+          echo 'EFI virtio ROM package verified; headless direct-kernel boot does not need network option ROM'
       - name: Fetch public reference Linux kernel
         run: |
           git clone --depth 1 --branch v6.6.100 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
@@ -54,7 +59,7 @@ jobs:
       - name: Boot isolated QEMU guest and verify KASAN
         run: |
           set +e
-          timeout 240s qemu-system-aarch64 -M virt -cpu cortex-a57 -m 3072 -smp 2 -nographic -no-reboot -kernel linux/arch/arm64/boot/Image -initrd initramfs.cpio.gz -append 'console=ttyAMA0 rdinit=/init panic=-1' > qemu-console.log 2>&1
+          timeout 240s qemu-system-aarch64 -M virt -cpu cortex-a57 -m 3072 -smp 2 -nodefaults -nic none -display none -monitor none -serial stdio -no-reboot -kernel linux/arch/arm64/boot/Image -initrd initramfs.cpio.gz -append 'console=ttyAMA0 rdinit=/init panic=-1' > qemu-console.log 2>&1
           code=$?
           set -e
           tail -n 90 qemu-console.log
