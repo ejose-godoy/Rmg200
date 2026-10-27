@@ -1,0 +1,17 @@
+name: REACH-19Y ARM64 invariant model
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  abstract-model:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm architecture
+        run: |
+          uname -m
+          test "$(uname -m)" = "aarch64"
+      - name: Validate abstract waiter/task invariants
+        run: python3 reach19y/check_invariants.py
