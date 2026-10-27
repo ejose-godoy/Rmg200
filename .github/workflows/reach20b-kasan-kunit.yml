@@ -76,12 +76,13 @@ jobs:
           grep -q 'REACH20B_KASAN_CONFIG_PASS' qemu-console.log
           grep -q 'REACH20B_KUNIT_CONFIG_PASS' qemu-console.log
           grep -q '# Subtest: kasan' qemu-console.log
-          grep -Eq 'ok [0-9]+ - kasan([[:space:]]|$)' qemu-console.log
-          if grep -Eq 'not ok [0-9]+ - kasan([[:space:]]|$)' qemu-console.log; then echo 'KASAN KUnit suite failed'; exit 1; fi
-          grep -Eq 'ok [0-9]+ - kmalloc_oob_right([[:space:]]|$)' qemu-console.log
-          grep -Eq 'ok [0-9]+ - kmalloc_uaf([[:space:]]|$)' qemu-console.log
+          grep -Eq 'ok [0-9]+( -)? kasan([[:space:]]|$)' qemu-console.log
+          if grep -Eq 'not ok [0-9]+( -)? kasan([[:space:]]|$)' qemu-console.log; then echo 'KASAN KUnit suite failed'; exit 1; fi
+          grep -Eq 'ok [0-9]+( -)? kmalloc_oob_right([[:space:]]|$)' qemu-console.log
+          grep -Eq 'ok [0-9]+( -)? kmalloc_uaf([[:space:]]|$)' qemu-console.log
+          grep -Eq '# kasan: pass:[1-9][0-9]* fail:0 skip:[0-9]+ total:[0-9]+' qemu-console.log
           grep -q 'BUG: KASAN:' qemu-console.log
-          { echo 'REACH20B: KASAN KUnit suite PASS'; echo "QEMU exit code: $code"; grep -E '(# Subtest: kasan|ok [0-9]+ - (kasan|kmalloc_oob_right|kmalloc_uaf))' qemu-console.log | tail -n 20; } | tee reach20b-result.txt
+          { echo 'REACH20B: KASAN KUnit suite PASS'; echo "QEMU exit code: $code"; grep -E '(# Subtest: kasan|# kasan: pass:|ok [0-9]+( -)? (kasan|kmalloc_oob_right|kmalloc_uaf))' qemu-console.log | tail -n 20; } | tee reach20b-result.txt
           echo "QEMU exit code: $code"
           echo 'PASS: ARM64 reference KASAN/KUnit suite detected expected memory errors'
       - name: Upload VM boot evidence
