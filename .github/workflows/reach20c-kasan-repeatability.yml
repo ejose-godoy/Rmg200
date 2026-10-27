@@ -1,0 +1,143 @@
+name: REACH-20C ARM64 KASAN repeatability (3 isolated boots)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/reach20c-kasan-repeatability.yml
+permissions:
+  contents: read
+jobs:
+  qemu-kasan:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    steps:
+      - name: Install build and virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git make gcc bc bison flex libssl-dev libelf-dev libncurses-dev qemu-system-arm qemu-system-data ipxe-qemu busybox-static cpio gzip
+          uname -m
+          test "$(uname -m)" = aarch64
+          qemu-system-aarch64 --version
+          dpkg-query -W qemu-system-arm qemu-system-data ipxe-qemu
+          test -s /usr/lib/ipxe/qemu/efi-virtio.rom
+          echo 'EFI virtio ROM package verified; headless direct-kernel boot does not need network option ROM'
+      - name: Fetch public reference Linux kernel
+        run: |
+          git clone --depth 1 --branch v6.6.100 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
+      - name: Configure reference kernel with KASAN
+        run: |
+          cd linux
+          make ARCH=arm64 defconfig
+          scripts/config --enable KASAN --enable KASAN_GENERIC --enable KASAN_INLINE --enable KUNIT --enable FTRACE --enable SCHED_TRACER --enable KASAN_KUNIT_TEST --enable IKCONFIG --enable IKCONFIG_PROC --enable DEVTMPFS --enable DEVTMPFS_MOUNT
+          scripts/config --set-val LOG_BUF_SHIFT 20
+          make ARCH=arm64 olddefconfig
+          grep -E '^CONFIG_(KASAN|KASAN_GENERIC|KUNIT|KASAN_KUNIT_TEST|IKCONFIG_PROC)=' .config
+          grep -qx 'CONFIG_KASAN=y' .config
+          grep -qx 'CONFIG_KASAN_GENERIC=y' .config
+          grep -qx 'CONFIG_KUNIT=y' .config
+          grep -qx 'CONFIG_KASAN_KUNIT_TEST=y' .config
+          grep -qx 'CONFIG_TRACEPOINTS=y' .config
+      - name: Build ARM64 reference kernel
+        run: |
+          make -C linux ARCH=arm64 -j2 Image
+          test -s linux/arch/arm64/boot/Image
+      - name: Create minimal read-only validation initramfs
+        run: |
+          mkdir -p initramfs/bin initramfs/proc initramfs/sys initramfs/dev
+          cp /bin/busybox initramfs/bin/busybox
+          ln -s busybox initramfs/bin/sh
+          cat > initramfs/init <<'EOF'
+          #!/bin/sh
+          /bin/busybox mount -t proc proc /proc
+          /bin/busybox mount -t sysfs sysfs /sys
+          echo REACH20C_GUEST_STARTED
+          if /bin/busybox zcat /proc/config.gz | /bin/busybox grep -qx 'CONFIG_KASAN=y'; then
+            echo REACH20C_KASAN_CONFIG_PASS
+          else
+            echo REACH20C_KASAN_CONFIG_FAIL
+          fi
+          if /bin/busybox zcat /proc/config.gz | /bin/busybox grep -qx 'CONFIG_KASAN_KUNIT_TEST=y'; then
+            echo REACH20C_KUNIT_CONFIG_PASS
+          else
+            echo REACH20C_KUNIT_CONFIG_FAIL
+          fi
+          /bin/busybox poweroff -f
+          EOF
+          chmod +x initramfs/init
+          (cd initramfs && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9) > initramfs.cpio.gz
+      - name: Repeat ARM64 KASAN KUnit boot three times and compare results
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, subprocess, sys
+
+          kernel = pathlib.Path("linux/arch/arm64/boot/Image")
+          digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+          command = [
+              "qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a57",
+              "-m", "3072", "-smp", "2", "-nodefaults", "-nic", "none",
+              "-display", "none", "-monitor", "none", "-serial", "stdio",
+              "-no-reboot", "-kernel", str(kernel), "-initrd", "initramfs.cpio.gz",
+              "-append", "console=ttyAMA0 rdinit=/init panic=-1 kunit.filter_glob=kasan",
+          ]
+          required = [
+              "REACH20C_GUEST_STARTED",
+              "REACH20C_KASAN_CONFIG_PASS",
+              "REACH20C_KUNIT_CONFIG_PASS",
+              "# Subtest: kasan",
+              "BUG: KASAN:",
+          ]
+          result = {"stage": "REACH-20C", "kernel": "Linux v6.6.100 reference ARM64",
+                    "image_sha256": digest, "boots": [], "status": "INCOMPLETE"}
+          def save():
+              pathlib.Path("reach20c-result.json").write_text(
+                  json.dumps(result, indent=2) + "\n")
+          for number in range(1, 4):
+              print(f"REACH20C_BOOT_{number}_START", flush=True)
+              try:
+                  completed = subprocess.run(command, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True,
+                                             errors="replace", timeout=300)
+                  log, rc = completed.stdout, completed.returncode
+              except subprocess.TimeoutExpired as exc:
+                  log = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                  rc = 124
+              pathlib.Path(f"reach20c-qemu-boot-{number}.log").write_text(log)
+              summary = re.search(r"# kasan: pass:(\d+) fail:(\d+) skip:(\d+) total:(\d+)", log)
+              counts = list(map(int, summary.groups())) if summary else None
+              checks = {
+                  "qemu_exit_zero": rc == 0,
+                  "required_markers": all(item in log for item in required),
+                  "suite_ok": bool(re.search(r"(?m)^.*\bok\s+\d+\s+(?:-\s*)?kasan\s*$", log)),
+                  "suite_no_fail": not bool(re.search(r"(?m)^.*\bnot ok\s+\d+\s+(?:-\s*)?kasan\b", log)),
+                  "oob_case": bool(re.search(r"(?m)^.*\bok\s+\d+\s+(?:-\s*)?kmalloc_oob_right\b", log)),
+                  "uaf_case": bool(re.search(r"(?m)^.*\bok\s+\d+\s+(?:-\s*)?kmalloc_uaf\b", log)),
+                  "kunit_totals": bool(counts and counts[0] > 0 and counts[1] == 0 and sum(counts[:3]) == counts[3]),
+              }
+              passed = all(checks.values())
+              result["boots"].append({"boot": number, "exit_code": rc, "counts": counts,
+                                      "checks": checks, "pass": passed})
+              save()
+              print(f"REACH20C_BOOT_{number}_{'PASS' if passed else 'FAIL'} counts={counts} exit={rc}", flush=True)
+              if not passed:
+                  print("Validation failed; last 45 console lines:", flush=True)
+                  print("\n".join(log.splitlines()[-45:]), flush=True)
+                  sys.exit(1)
+          tuples = [tuple(boot["counts"]) for boot in result["boots"]]
+          result["repeatable_counts"] = len(set(tuples)) == 1
+          result["status"] = "PASS" if result["repeatable_counts"] else "FAIL"
+          save()
+          print("REACH20C_REPEATABILITY_" + result["status"], flush=True)
+          print("REACH20C_KERNEL_SHA256=" + digest, flush=True)
+          if result["status"] != "PASS":
+              sys.exit(1)
+          PY
+      - name: Upload VM boot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach20c-kasan-repeatability-evidence
+          path: |
+            reach20c-qemu-boot-*.log
+            linux/.config
+            reach20c-result.json
+          if-no-files-found: warn
