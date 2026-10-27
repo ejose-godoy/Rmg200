@@ -28,13 +28,15 @@ jobs:
         run: |
           cd linux
           make ARCH=arm64 defconfig
-          scripts/config --enable KASAN --enable KASAN_GENERIC --enable KASAN_INLINE --enable KUNIT --enable TRACEPOINTS --enable KASAN_KUNIT_TEST --enable IKCONFIG --enable IKCONFIG_PROC --enable DEVTMPFS --enable DEVTMPFS_MOUNT
+          scripts/config --enable KASAN --enable KASAN_GENERIC --enable KASAN_INLINE --enable KUNIT --enable FTRACE --enable SCHED_TRACER --enable KASAN_KUNIT_TEST --enable IKCONFIG --enable IKCONFIG_PROC --enable DEVTMPFS --enable DEVTMPFS_MOUNT
+          scripts/config --set-val LOG_BUF_SHIFT 20
           make ARCH=arm64 olddefconfig
           grep -E '^CONFIG_(KASAN|KASAN_GENERIC|KUNIT|KASAN_KUNIT_TEST|IKCONFIG_PROC)=' .config
           grep -qx 'CONFIG_KASAN=y' .config
           grep -qx 'CONFIG_KASAN_GENERIC=y' .config
           grep -qx 'CONFIG_KUNIT=y' .config
           grep -qx 'CONFIG_KASAN_KUNIT_TEST=y' .config
+          grep -qx 'CONFIG_TRACEPOINTS=y' .config
       - name: Build ARM64 reference kernel
         run: |
           make -C linux ARCH=arm64 -j2 Image
