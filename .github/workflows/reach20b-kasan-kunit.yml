@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - .github/workflows/reach20b-qemu-kasan.yml
+      - .github/workflows/reach20b-kasan-kunit.yml
 permissions:
   contents: read
 jobs:
