@@ -1,0 +1,54 @@
+name: Moto G200 - REACH-01 Futex PI QEMU (isolado)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [reach01-20261019]
+    paths:
+      - .github/workflows/arm64-reach01.yml
+      - scripts/run-reach01.sh
+      - scripts/instrument-reach01.py
+      - initramfs/reach01_init.c
+      - tests/test_reach01.py
+
+# Nao acessar imagem Motorola, dados privados, credenciais ou telefone.
+permissions:
+  contents: read
+
+concurrency:
+  group: reach01-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  reach01:
+    name: Android Common 5.4.147 ARM64 - rollback PI sem privilegios
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout somente fonte PUBLICA do laboratorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preflight impede upload de qualquer binario privado
+        run: bash scripts/preflight.sh
+      - name: Dependencias no runner efemero
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison flex build-essential gcc-12 libelf-dev libssl-dev \
+            cpio gzip xz-utils git make qemu-system-arm python3
+      - name: Validacao estatica do REACH-01 e baseline
+        run: bash scripts/verify-local.sh
+      - name: Instrumentar kernel publico e testar Futex PI no QEMU
+        run: bash scripts/run-reach01.sh
+      - name: Publicar SOMENTE logs e verificacoes, nenhum kernel ou imagem
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach01-arm64-lab-evidencias
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
